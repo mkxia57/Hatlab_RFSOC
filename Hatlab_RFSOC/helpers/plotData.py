@@ -21,6 +21,7 @@ def plotIQTrace(iq_list, ro_chs=None):
         plot.legend()
 
     plt.tight_layout()
+    return fig, axs
 
 
 def plotAvgIQresults(xdata, avgi, avgq, windowName=None, title=None, xlabel=None, ylabel=None, sub_titles:list=None):
@@ -59,22 +60,28 @@ def plotIQHist2dLog(di_buf, dq_buf, ro_chs=None, bins=101):
         ax.set_ylabel("Q")
         ax.set_xlabel("I")
     
-def plotIQHist2d(di_buf, dq_buf, ro_chs=None, bins=101, logPlot=False):
+def plotIQHist2d(di_buf, dq_buf, ro_chs=None, bins=101, logPlot=False, hist_range=None):
     n_ch = len(di_buf)
+
     fig, axs = plt.subplots(1, n_ch, figsize=(1+n_ch*5, 4.5))
     if n_ch == 1:
         axs = [axs]
     for i in range(n_ch):
+        if hist_range is None:
+            r_ = np.max(np.abs([di_buf[i], dq_buf[i]]))
+            range_ = [[-r_, r_], [-r_, r_]]
+        else:
+            range_ = hist_range
+        
         ax = axs[i]
-        range_ = np.max(np.abs([di_buf[i], dq_buf[i]]))
         if ro_chs is not None:
             ax.set_title("ADC %d"%(ro_chs[i]))
         if logPlot:
-            hist, x, y = np.histogram2d(di_buf[i], dq_buf[i], bins=bins, range=[[-range_, range_],[-range_, range_]])
+            hist, x, y = np.histogram2d(di_buf[i], dq_buf[i], bins=bins, range=range_)
             pcm = ax.pcolor(x,y,np.log(hist).T)
             fig.colorbar(pcm, ax=ax)
         else:
-            pcm = ax.hist2d(di_buf[i], dq_buf[i], bins=bins, range=[[-range_, range_],[-range_, range_]])
+            pcm = ax.hist2d(di_buf[i], dq_buf[i], bins=bins, range=range_)
             fig.colorbar(pcm[3], ax=ax)
         ax.set_aspect(1)
         ax.set_ylabel("Q")

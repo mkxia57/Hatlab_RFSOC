@@ -178,12 +178,27 @@ class APAveragerProgram(QickRegisterManagerMixin, AcquireMixin, QickProgram):
             # self.declare_readout(**kws)
             ch = int(kws["ch"])
             if self.soccfg['readouts'][ch].get('tproc_ctrl') is None:
+                if "weights" in kws.keys():
+                    ro_weights = self.get_readout_weight(kws)
+                    kws['weights'] = ro_weights
                 self.declare_readout(**kws)
             else:
                 self.declare_readout(ch=ch, length=kws["length"])
                 freq_ro = self.freq2reg_adc(kws["freq"], ro_ch=ch, gen_ch=kws["gen_ch"])
                 self.set_readout_registers(ch=ch, freq=freq_ro, length=kws["length"], # The length here actually doesn't matter
                                            mode='oneshot', outsel='product', phrst=kws.get("phrst",0))
+
+    def get_readout_weight(self, ro_cfg):
+        w = ro_cfg.get("weights", None)
+        if type(w) == str:
+            filetype = w.split('.')[-1]
+            if filetype.lower() == "npy":
+                return np.load(w)
+            elif filetype.lower() in ['txt', 'csv']:
+                return np.loadtxt(w, delimiter=',')
+        elif type(w) == list:
+            return np.array(w)
+        return w
 
 
     def get_gen_reg(self, gen_ch: Union[str, int], name: str) -> QickRegister:
@@ -348,7 +363,8 @@ class APAveragerProgram(QickRegisterManagerMixin, AcquireMixin, QickProgram):
         """
         if debug:
             print(self.asm())
-        buf = super().acquire_decimated(soc, soft_avgs=self.soft_avgs, load_pulses=True, start_src="internal", progress=True, remove_offset=True)
+        buf = super().acquire_decimated(soc, rounds=self.soft_avgs, load_pulses=True, start_src="internal", progress=progress, remove_offset=True)  # firmware 2025
+        # buf = super().acquire_decimated(soc, soft_avgs=self.soft_avgs, load_pulses=True, start_src="internal", progress=progress, remove_offset=True)  # firmware 2024
         # return buf
         # buf = super().acquire_decimated(soc, reads_per_rep=readouts_per_experiment, load_pulses=load_pulses, start_src=start_src, progress=progress, debug=debug)
         # move the I/Q axis from last to second-last
@@ -543,17 +559,33 @@ class NDAveragerProgram(APAveragerProgram):
         if readouts_per_experiment is not None:
             self.set_reads_per_shot(readouts_per_experiment)
 
-        avg_d = super().acquire(soc, soft_avgs=self.soft_avgs, load_pulses=load_pulses,
-                                              start_src=start_src, 
+        avg_d = super().acquire(soc, rounds=self.soft_avgs, load_pulses=load_pulses,  # firmware 2025
+                                              start_src=start_src,
                                               threshold=threshold, angle=angle,
                                               progress=progress,
                                               remove_offset=remove_offset)
+        # avg_d = super().acquire(soc, soft_avgs=self.soft_avgs, load_pulses=load_pulses,  # firmware 2023
+        #                                       start_src=start_src, 
+        #                                       threshold=threshold, angle=angle,
+        #                                       progress=progress,
+        #                                       remove_offset=remove_offset)
 
         # reformat the data into separate I and Q arrays
         # save results to class in case you want to look at it later or for analysis
         raw = [d.reshape((-1,2)) for d in self.get_raw()]
-        self.di_buf = [d[:,0] for d in raw]
-        self.dq_buf = [d[:,1] for d in raw]
+        if remove_offset:
+            self.di_buf = []
+            self.dq_buf = []
+            for i, (ch_key, ch_cfg) in enumerate(self.cfg['ro_chs'].items()):
+                ch = ch_cfg['ch']
+                iq_offset = self.soccfg['readouts'][ch]['iq_offset'] * ch_cfg['length']
+                d = raw[i]
+                self.di_buf.append(d[:, 0] - iq_offset)
+                self.dq_buf.append(d[:, 1] - iq_offset)
+
+        else:
+            self.di_buf = [d[:,0] for d in raw]
+            self.dq_buf = [d[:,1] for d in raw]
 
         expt_pts = self.get_expt_pts()
 
@@ -639,22 +671,22 @@ class NDAveragerProgram(APAveragerProgram):
     # 
     #     return expt_pts, avg_di, avg_dq
     
-    def _average_buf(self, d_reps, reads_per_rep: int, length_norm: bool=True, remove_offset: bool=True):
-        """
-        overwrites the default _average_buf method in QickProgram. Here "reps" is the outermost axis, and we reshape
-        avg_d to the shape of the sweep axes.
-        :param d_reps:
-        :param reads_per_rep:
-        :return:
-        """
-        reads_per_rep = reads_per_rep[0]
-        avg_d = np.zeros((len(self.ro_chs), reads_per_rep, self.expts, 2))
-        for ii in range(reads_per_rep):
-            for i_ch, (ch, ro) in enumerate(self.ro_chs.items()):
-                avg_d[i_ch][ii] = np.sum(d_reps[i_ch].reshape((-1, 2))[ii::reads_per_rep, :].reshape((self.reps, self.expts, 2)), axis=0)
-                if length_norm:
-                    avg_d[i_ch][ii] /= (self.reps * ro['length'])
-        return avg_d
+    # def _average_buf(self, d_reps, reads_per_rep: int, length_norm: bool=True, remove_offset: bool=True):
+    #     """
+    #     overwrites the default _average_buf method in QickProgram. Here "reps" is the outermost axis, and we reshape
+    #     avg_d to the shape of the sweep axes.
+    #     :param d_reps:
+    #     :param reads_per_rep:
+    #     :return:
+    #     """
+    #     reads_per_rep = reads_per_rep[0]
+    #     avg_d = np.zeros((len(self.ro_chs), reads_per_rep, self.expts, 2))
+    #     for ii in range(reads_per_rep):
+    #         for i_ch, (ch, ro) in enumerate(self.ro_chs.items()):
+    #             avg_d[i_ch][ii] = np.sum(d_reps[i_ch].reshape((-1, 2))[ii::reads_per_rep, :].reshape((self.reps, self.expts, 2)), axis=0)
+    #             if length_norm:
+    #                 avg_d[i_ch][ii] /= (self.reps * ro['length'])
+    #     return avg_d
 
 
 class QCAveragerProgram(NDAveragerProgram):

@@ -80,6 +80,9 @@ class Experiment():
 
         ## run program (and save data)
         if save_data:
+            if 'pulse_mod' in self.cfg.keys():
+                self.cfg["pulse_mod"] = str(self.cfg["pulse_mod"])
+
             if ddw.inserted_rows == 0:
                 ddw.__enter__()
 
