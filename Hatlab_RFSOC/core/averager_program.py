@@ -338,7 +338,8 @@ class APAveragerProgram(QickRegisterManagerMixin, AcquireMixin, QickProgram):
 
         :return:
         """
-        add_waveform(self, gen_ch, name, shape, **kwargs)
+        ch = self.cfg['gen_chs'][gen_ch]['ch']
+        add_waveform(self, ch, name, shape, **kwargs)
 
     def add_waveform_from_cfg(self, gen_ch: str, name: str):
         """
@@ -363,8 +364,8 @@ class APAveragerProgram(QickRegisterManagerMixin, AcquireMixin, QickProgram):
         """
         if debug:
             print(self.asm())
-        buf = super().acquire_decimated(soc, rounds=self.soft_avgs, load_pulses=True, start_src="internal", progress=progress, remove_offset=True)  # firmware 2025
-        # buf = super().acquire_decimated(soc, soft_avgs=self.soft_avgs, load_pulses=True, start_src="internal", progress=progress, remove_offset=True)  # firmware 2024
+        buf = super().acquire_decimated(soc, rounds=self.soft_avgs, load_pulses=True, start_src="internal", progress=progress, remove_offset=True)  # qick 0.2.348
+        # buf = super().acquire_decimated(soc, soft_avgs=self.soft_avgs, load_pulses=True, start_src="internal", progress=progress, remove_offset=True)  # qick 0.2.267
         # return buf
         # buf = super().acquire_decimated(soc, reads_per_rep=readouts_per_experiment, load_pulses=load_pulses, start_src=start_src, progress=progress, debug=debug)
         # move the I/Q axis from last to second-last
@@ -559,7 +560,7 @@ class NDAveragerProgram(APAveragerProgram):
         if readouts_per_experiment is not None:
             self.set_reads_per_shot(readouts_per_experiment)
 
-        avg_d = super().acquire(soc, rounds=self.soft_avgs, load_pulses=load_pulses,  # firmware 2025
+        avg_d = super().acquire(soc, rounds=self.soft_avgs, load_pulses=load_pulses,  # qick 0.2.348
                                               start_src=start_src,
                                               threshold=threshold, angle=angle,
                                               progress=progress,
