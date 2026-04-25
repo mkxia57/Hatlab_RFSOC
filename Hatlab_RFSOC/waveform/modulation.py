@@ -1,13 +1,137 @@
 import warnings
-from typing import List, Union, Type, Callable
+from abc import ABC, abstractmethod
+from typing import List, Union, Type, Callable, Dict
 import numpy as np
-from qick.asm_v1 import QickProgram
 import matplotlib.pyplot as plt
 
 NumType = Union[int, float]
 
 
-class DragModulation:
+class ModulationRegistry:
+    """Factory registry for creating modulation objects from config dicts.
+    
+    Example usage:
+        config = {
+            'eta_correct': {
+                'type': 'WaveformCorrection',
+                'filepath': 'path/to/calib.csv',
+                'freq': 1200,
+                'scale': 'linear',
+                'max_scale': 0.5
+            }
+        }
+        modulation = ModulationRegistry.from_dict(config['eta_correct'])
+    """
+    _registry = {}
+
+    @classmethod
+    def register(cls, name: str, modulation_cls: Type):
+        """Register a modulation class."""
+        cls._registry[name] = modulation_cls
+
+    @classmethod
+    def from_dict(cls, config: Dict) -> 'Modulation':
+        """Create a modulation object from a config dict.
+        
+        Parameters
+        ----------
+        config : dict
+            Dictionary with 'type' key and additional kwargs for the modulation class.
+            Example: {'type': 'WaveformCorrection', 'filepath': '...', 'freq': 1200, ...}
+        
+        Returns
+        -------
+        Modulation
+            An instance of the requested modulation class.
+        """
+        if not isinstance(config, dict):
+            raise TypeError(f"config must be a dict, got {type(config)}")
+        
+        config_copy = config.copy()
+        type_name = config_copy.pop('type', None)
+        
+        if type_name is None:
+            raise ValueError("config dict must have a 'type' key")
+        
+        # Case-insensitive lookup
+        for registered_name in cls._registry:
+            if registered_name.lower() == type_name.lower():
+                type_name = registered_name
+                break
+        
+        if type_name not in cls._registry:
+            raise ValueError(f"Modulation type '{type_name}' not registered. "
+                           f"Available types: {list(cls._registry.keys())}")
+        
+        return cls._registry[type_name](**config_copy)
+
+    @classmethod
+    def create(cls, modulation_type: str, *args, **kwargs) -> 'Modulation':
+        """Create a modulation object by type name and arguments.
+        
+        Parameters
+        ----------
+        modulation_type : str
+            Name of the modulation type (case-insensitive).
+        *args
+            Positional arguments for the modulation class constructor.
+        **kwargs
+            Keyword arguments for the modulation class constructor.
+        
+        Returns
+        -------
+        Modulation
+            An instance of the requested modulation class.
+        
+        Examples
+        --------
+        >>> mod = ModulationRegistry.create('DragModulation', drag_factor=0.05)
+        >>> mod = ModulationRegistry.create('WaveformCorrection', filepath='...', freq=1200, scale='linear')
+        """
+        # Case-insensitive lookup
+        for registered_name in cls._registry:
+            if registered_name.lower() == modulation_type.lower():
+                modulation_type = registered_name
+                break
+        
+        if modulation_type not in cls._registry:
+            raise ValueError(f"Modulation type '{modulation_type}' not registered. "
+                           f"Available types: {list(cls._registry.keys())}")
+        
+        return cls._registry[modulation_type](*args, **kwargs)
+
+    @classmethod
+    def available_modulations(cls):
+        """Return list of available modulation types."""
+        return list(cls._registry.keys())
+
+
+class Modulation(ABC):
+    """Abstract base class for all waveform modulations.
+    
+    All modulation classes must implement the apply_modulation method.
+    """
+    
+    @abstractmethod
+    def apply_modulation(self, waveform: np.ndarray, sampling_rate: float) -> np.ndarray:
+        """Apply modulation to a waveform.
+        
+        Parameters
+        ----------
+        waveform : np.ndarray
+            Input waveform (can be complex).
+        sampling_rate : float
+            Sampling rate in Hz.
+        
+        Returns
+        -------
+        np.ndarray
+            Modified waveform.
+        """
+        pass
+
+
+class DragModulation(Modulation):
     def __init__(self, drag_factor, drag_func: Callable = None):
         """
         Apply a drag modulation to the input waveform.
@@ -30,7 +154,58 @@ class DragModulation:
         return waveform + wf_drag
 
 
-class ChirpModulation:
+class FrequencyConversion(Modulation):
+    def __init__(self, freq_if, phase=0):
+        """
+        Apply a frequency modulation to the input waveform. Move the waveform from the baseband to freq_if
+
+        Parameters:
+        - freq_if: the IF frequency. Upconvert waveform if positive
+        - phase: an additional phase to the modulation. Default value is 0
+        """
+        self.freq_if = freq_if
+        self.phase = phase
+
+    def apply_modulation(self, waveform, sampling_rate):
+        """
+        Apply a frequency modulation to the input waveform.
+
+        Parameters:
+        - waveform: Input waveform array.
+        - sampling_rate: sampling_rate of the waveform
+        """
+        mod_phase = 2*np.pi * self.freq_if * np.arange(waveform.size)/sampling_rate + np.deg2rad(self.phase)
+        wf_mod = waveform * np.exp(1j * mod_phase)
+        return wf_mod
+
+
+class MultiFrequency(Modulation):
+    def __init__(self, freq_if_list, phase=0):
+        """
+        Apply a frequency modulation to the input waveform. Move the waveform from the baseband to freq_if
+
+        Parameters:
+        - freq_if: the IF frequency. Upconvert signal if positive
+        - phase: an additional phase to the modulation. Default value is 0
+        """
+        self.freq_if_list = freq_if_list
+        self.phase = phase
+
+    def apply_modulation(self, waveform, sampling_rate):
+        """
+        Apply a frequency modulation to the input waveform.
+
+        Parameters:
+        - waveform: Input waveform array.
+        - sampling_rate: sampling_rate of the waveform
+        """
+        mod_phase_list = [2*np.pi * freq_if * np.arange(waveform.size)/sampling_rate + np.deg2rad(self.phase)
+                          for freq_if in self.freq_if_list]
+        wf_mod = sum([waveform * np.exp(1j * mod_phase) for mod_phase in mod_phase_list])/len(self.freq_if_list)
+        return wf_mod
+
+
+class ChirpModulation(Modulation):
     def __init__(self, chirp_func, maxf, maxv=None):
         """
         Apply a chirp modulation to the input waveform.
@@ -76,18 +251,33 @@ class ChirpModulation:
         return wf_chirp
 
 
-class WaveformCorrection:
-    def __init__(self, filepath, freq, scale: str = "linear", max_scale=0.5):
+class WaveformCorrection(Modulation):
+    def __init__(self, filepath, freq, freq_ref: float=None, scale: str = "linear", max_scale=0.5):
+        """
+        Correct the wavefrom amplitude and distortion in the frequency domain.
+        The amplitude experienced by qubits/couplers are frequency dependent, because of the DDS signal and
+        S21 of the whole input line. Also, considering the input line as a filter, the waveform is distorted
+        by the input line.
+        Such distortion can be cancelled by pre-distorting the waveform in the  waveform definition.
+         
+        :param filepath: the filepath of calibration file
+        :param scale: the scale of calibration amplitude data, linear or dB
+        :param freq: the LO frequency of the pulse
+        :param freq_ref: the reference frequency that defines the unit amplitude in calibration func
+        :param max_scale: if freq_ref is None, freq_ref is find by amp(freq_ref) == max_scale * max_amplitude
+        :return:
+        """
         self.calibration_data = self.get_calib_data(filepath)
         self.freq = freq
         self.scale = scale
         self.max_scale = max_scale
-        if scale.lower() in ["db", "dbm", "log"]:
-            self.freq_ref = self.calibration_data[0][
-                np.argmin(np.abs(self.calibration_data[1] - (np.max(self.calibration_data[1]) - 3)))]
-        elif scale.lower() == "linear":
-            self.freq_ref = self.calibration_data[0][
-                np.argmin(np.abs(self.calibration_data[1] - max_scale*np.max(self.calibration_data[1])))]
+        if freq_ref is None:
+            if scale.lower() in ["db", "dbm", "log"]:
+                self.freq_ref = self.calibration_data[0][
+                    np.argmin(np.abs(self.calibration_data[1] - (np.max(self.calibration_data[1]) + 10*np.log10(max_scale))))]
+            elif scale.lower() == "linear":
+                self.freq_ref = self.calibration_data[0][
+                    np.argmin(np.abs(self.calibration_data[1] - max_scale*np.max(self.calibration_data[1])))]
 
         self.calibration_func = self.get_calibration_func(freq_ref=self.freq_ref, attenuation=0)
         self.recover_func = self.get_recover_func(freq_ref=self.freq_ref, attenuation=0)
@@ -135,9 +325,7 @@ class WaveformCorrection:
         Modify a waveform in the frequency domain and return the modified time-domain waveform.
 
         Parameters:
-            - signal (np.array): Input time-domain signal (can be complex or real).
-            - calibration_func (callable): A function that takes (fft_freq, fft_values) as inputs
-                                          and returns modified fft_values.
+            - waveform (np.array): Input time-domain signal (can be complex or real).
             - sampling_rate (float): Sampling rate of the signal in Hz.
 
         Returns:
@@ -173,9 +361,7 @@ class WaveformCorrection:
         Modify a waveform in the frequency domain and return the modified time-domain waveform.
 
         Parameters:
-            - signal (np.array): Input time-domain signal (can be complex or real).
-            - calibration_func (callable): A function that takes (fft_freq, fft_values) as inputs
-                                          and returns modified fft_values.
+            - waveform (np.array): Input time-domain signal (can be complex or real).
             - sampling_rate (float): Sampling rate of the signal in Hz.
 
         Returns:
@@ -258,6 +444,14 @@ class WaveformCorrection:
         ax.plot(self.calibration_data[0], self.calibration_data[1])
         ax.set_xlabel("Frequency (MHz)")
         return fig, ax
+
+
+# Register all modulation classes
+ModulationRegistry.register('DragModulation', DragModulation)
+ModulationRegistry.register('FrequencyConversion', FrequencyConversion)
+ModulationRegistry.register('MultiFrequency', MultiFrequency)
+ModulationRegistry.register('ChirpModulation', ChirpModulation)
+ModulationRegistry.register('WaveformCorrection', WaveformCorrection)
 
 
 

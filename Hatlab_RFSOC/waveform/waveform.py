@@ -1,8 +1,11 @@
 import warnings
-from typing import List, Union, Type, Callable
+from typing import List, Dict, Union, Type, Callable
 import numpy as np
 from qick.asm_v1 import QickProgram
+from qick.qick_asm import QickConfig
 import matplotlib.pyplot as plt
+from Hatlab_RFSOC.waveform.modulation import ModulationRegistry
+
 
 
 NumType = Union[int, float]
@@ -34,8 +37,8 @@ class Waveform:
         super().__init_subclass__(**kwargs)
         WaveformRegistry.register(cls.__name__, cls)
 
-    def __init__(self, prog: QickProgram, gen_ch: Union[int, str], phase, maxv):
-        self._set_channel_cfg(prog, gen_ch)
+    def __init__(self, soccfg: QickConfig, gen_ch: Union[int, str], phase, maxv):
+        self._set_channel_cfg(soccfg, gen_ch)
         self.maxv = self.soc_gencfg['maxv'] * self.soc_gencfg['maxv_scale'] if maxv is None else maxv
         self.phase = phase
         self.waveform = None
@@ -52,8 +55,8 @@ class Waveform:
         raise NotImplementedError("Subclasses must implement _generate_waveform().")
 
     def add_waveform(self, prog: QickProgram, name):
-        idata = self._pad_waveform(np.real(self.waveform))
-        qdata = self._pad_waveform(np.imag(self.waveform))
+        idata = self.pad_to_clk_cycle(np.real(self.waveform))
+        qdata = self.pad_to_clk_cycle(np.imag(self.waveform))
 
         if np.max(np.abs(idata)) > 32766 or np.max(np.abs(qdata)) > 32766:
             i_max, q_max = np.max(np.abs(idata)), np.max(np.abs(qdata))
@@ -65,9 +68,9 @@ class Waveform:
 
         prog.add_pulse(self.gen_ch, name, idata=idata.astype(int), qdata=qdata.astype(int))
 
-    def _set_channel_cfg(self, prog: QickProgram, gen_ch: Union[int, str]):
-        self.gen_ch = prog.cfg["gen_chs"][gen_ch]["ch"] if isinstance(gen_ch, str) else gen_ch
-        self.soc_gencfg = prog.soccfg['gens'][self.gen_ch]
+    def _set_channel_cfg(self, soccfg: QickConfig, gen_ch: int):
+        self.gen_ch = gen_ch
+        self.soc_gencfg = soccfg['gens'][gen_ch]
         self.samps_per_clk = self.soc_gencfg['samps_per_clk']
         self.fclk = self.soc_gencfg['f_fabric']
         self.sampling_rate = self.samps_per_clk * self.fclk
@@ -76,7 +79,7 @@ class Waveform:
         """Convert length in physical units to register units."""
         return length * self.sampling_rate
 
-    def _pad_waveform(self, waveform: np.ndarray) -> np.ndarray:
+    def pad_to_clk_cycle(self, waveform: np.ndarray) -> np.ndarray:
         """Pad waveform with zeros so that it's length is a multiple of samps_per_clk."""
         pad_len = (-len(waveform)) % self.samps_per_clk
         return np.pad(waveform, (0, pad_len))
@@ -109,13 +112,18 @@ class Waveform:
 
 
 class Gaussian(Waveform):
-    def __init__(self, prog, gen_ch, length, sigma, phase=0, maxv=None,
-                 padding: Union[float, List[float], None] = None):
-        super().__init__(prog, gen_ch, phase=phase, maxv=maxv)
+    def __init__(self, soccfg: QickConfig, gen_ch, length, sigma, phase=0, maxv=None,
+                 padding: Union[float, List[float], None] = None, modulations: Union[List, tuple] = None,
+                 shape=None):
+        super().__init__(soccfg, gen_ch, phase=phase, maxv=maxv)
         self.sigma_samps = self.us_to_samps(sigma)
         self.length_samps = self.us_to_samps(length)
         self.padding = padding
+        self.modulations = modulations if modulations is not None else []
         self.waveform = self._generate_waveform(self.length_samps, self.sigma_samps)
+        # Register custom shape if provided
+        if shape is not None:
+            WaveformRegistry.register(shape, self.__class__)
 
     @staticmethod
     def core(length, sigma):
@@ -130,20 +138,28 @@ class Gaussian(Waveform):
         generate in-phase (I) and quadrature (Q) components
         """
         waveform = self.maxv * self.core(*args, **kwargs)
-        waveform_padded = self._apply_padding(waveform, self.padding)
-        waveform_wphase = np.exp(1j * np.deg2rad(self.phase)) * waveform_padded
-        return waveform_wphase
+        waveform = self._apply_padding(waveform, self.padding)
+        waveform = np.exp(1j * np.deg2rad(self.phase)) * waveform
+        # Apply modulations if any
+        for mod in self.modulations:
+            waveform = mod.apply_modulation(waveform, self.sampling_rate)
+        return waveform
 
 
 class TanhBox(Waveform):
-    def __init__(self, prog, gen_ch, length, ramp_width, cut_offset=0.01, phase=0, maxv=None,
-                 padding: Union[float, List[float], None] = None):
-        super().__init__(prog, gen_ch, phase=phase, maxv=maxv)
+    def __init__(self, soccfg: QickConfig, gen_ch, length: float, ramp_width: float, cut_offset=0.01, phase=0, maxv=None,
+                 padding: Union[float, List[float], None] = None, modulations: Union[List, tuple] = None,
+                 shape=None):
+        super().__init__(soccfg, gen_ch, phase=phase, maxv=maxv)
         self.ramp_samps = self.us_to_samps(ramp_width)
         self.length_samps = self.us_to_samps(length)
         self.cut_offset = cut_offset
         self.padding = padding
+        self.modulations = modulations if modulations is not None else []
         self.waveform = self._generate_waveform(self.length_samps, self.ramp_samps, self.cut_offset)
+        # Register custom shape if provided
+        if shape is not None:
+            WaveformRegistry.register(shape, self.__class__)
 
     @staticmethod
     def core(length, ramp_width, cut_offset):
@@ -167,15 +183,35 @@ class TanhBox(Waveform):
         generate in-phase (I) and quadrature (Q) components
         """
         waveform = self.maxv * self.core(*args, **kwargs)
-        waveform_padded = self._apply_padding(waveform, self.padding)
-        waveform_wphase = np.exp(1j * np.deg2rad(self.phase)) * waveform_padded
-        return waveform_wphase
+        waveform = self._apply_padding(waveform, self.padding)
+        waveform = np.exp(1j * np.deg2rad(self.phase)) * waveform
+        # Apply modulations if any
+        for mod in self.modulations:
+            waveform = mod.apply_modulation(waveform, self.sampling_rate)
+        return waveform
+
+
+# Backward compatibility aliases
+class GaussianModulated(Gaussian):
+    """Alias for Gaussian. Kept for backward compatibility.
+    
+    Use Gaussian(..., modulations=[...]) instead.
+    """
+    pass
+
+# Backward compatibility aliases
+class TanhBoxModulated(TanhBox):
+    """Alias for TanhBox. Kept for backward compatibility.
+    
+    Use TanhBox(..., modulations=[...]) instead.
+    """
+    pass
 
 
 class FileDefined(Waveform):
-    def __init__(self, prog, gen_ch, filepath, phase=0, maxv=None, drag_coeff=0,
+    def __init__(self, soccfg: QickConfig, gen_ch, filepath, phase=0, maxv=None, drag_coeff=0,
                  padding: Union[float, List[float], None] = None):
-        super().__init__(prog, gen_ch, phase=phase, maxv=maxv)
+        super().__init__(soccfg, gen_ch, phase=phase, maxv=maxv)
         self.filepath = filepath
         self.padding = padding
         self.drag_coeff = drag_coeff
@@ -222,83 +258,83 @@ class FileDefined(Waveform):
         return waveform_wphase
 
 
-class GaussianModulated(Waveform):
-    def __init__(self, prog, gen_ch, length, sigma, phase=0, maxv=None, modulations: list = (),
-                 padding: Union[float, List[float], None] = None, shape=None):
-        super().__init__(prog, gen_ch, phase=phase, maxv=maxv)
-        self.sigma_samps = self.us_to_samps(sigma)
-        self.length_samps = self.us_to_samps(length)
+class Arbitrary(Waveform):
+    # not tested yet.
+    """Waveform from arbitrary IQ data.
+    
+    Accepts IQ data directly as a complex array or separate I and Q arrays.
+    """
+    def __init__(self, soccfg: QickConfig, gen_ch, iq_data: Union[np.ndarray, tuple], 
+                 phase=0, maxv=None, padding: Union[float, List[float], None] = None,
+                 modulations: Union[List, tuple] = None, shape=None):
+        """
+        Parameters
+        ----------
+        soccfg : QickConfig
+            QickConfig object
+        gen_ch : int or str
+            Generator channel
+        iq_data : np.ndarray or tuple
+            Complex IQ data as:
+            - Complex array: np.array([1+1j, 2+2j, ...])
+            - Tuple of (I, Q) arrays: (idata, qdata)
+        phase : float
+            Phase in degrees
+        maxv : float, optional
+            Maximum voltage. If None, uses default from soccfg.
+        padding : float or list, optional
+            Padding before and/or after waveform in microseconds.
+        modulations : list, optional
+            List of Modulation objects to apply.
+        shape : str, optional
+            Custom shape name for registry.
+        """
+        super().__init__(soccfg, gen_ch, phase=phase, maxv=maxv)
         self.padding = padding
-        self.modulations = modulations
-        self.waveform = self._generate_waveform(self.length_samps, self.sigma_samps)
-        shape = shape if shape is not None else self.__class__.__name__
-        WaveformRegistry.register(shape, self.__class__)
+        self.modulations = modulations if modulations is not None else []
+        self.waveform = self._generate_waveform(iq_data=iq_data)
+        # Register custom shape if provided
+        if shape is not None:
+            WaveformRegistry.register(shape, self.__class__)
 
     @staticmethod
-    def core(length, sigma):
-        """the definetion of Gaussian"""
-        t = np.arange(length)
-        y = np.exp(-(t - length / 2) ** 2 / sigma ** 2)
-        return y - np.min(y)
+    def core(iq_data: Union[np.ndarray, tuple]) -> np.ndarray:
+        """Convert IQ data to complex waveform.
+        
+        Parameters
+        ----------
+        iq_data : np.ndarray or tuple
+            Complex array or (I, Q) tuple
+        
+        Returns
+        -------
+        np.ndarray
+            Complex waveform
+        """
+        if isinstance(iq_data, tuple) and len(iq_data) == 2:
+            idata, qdata = iq_data
+            return np.asarray(idata) + 1j * np.asarray(qdata)
+        else:
+            return np.asarray(iq_data)
 
-    def _generate_waveform(self, *args, **kwargs):
-        """
-        apply the necessary modificaiton to the core function,
-        generate in-phase (I) and quadrature (Q) components
-        """
-        waveform = self.maxv * self.core(*args, **kwargs)
+    def _generate_waveform(self, iq_data: Union[np.ndarray, tuple]):
+        """Generate waveform from IQ data with optional modulations."""
+        waveform = self.core(iq_data)
+        # Normalize to maxv
+        waveform_max = np.max(np.abs(waveform))
+        if waveform_max > 0:
+            waveform = self.maxv * waveform / waveform_max
         waveform = self._apply_padding(waveform, self.padding)
         waveform = np.exp(1j * np.deg2rad(self.phase)) * waveform
-        for mod in self.modulations:
-            waveform = mod.apply_modulation(waveform, self.sampling_rate)
-        return waveform
-
-
-class TanhBoxModulated(Waveform):
-    def __init__(self, prog, gen_ch, length, ramp_width, cut_offset=0.01, phase=0, maxv=None, modulations: list = (),
-                 padding: Union[float, List[float], None] = None, shape=None):
-        super().__init__(prog, gen_ch, phase=phase, maxv=maxv)
-        self.ramp_samps = self.us_to_samps(ramp_width)
-        self.length_samps = self.us_to_samps(length)
-        self.cut_offset = cut_offset
-        self.padding = padding
-        self.modulations = modulations
-        self.waveform = self._generate_waveform(self.length_samps, self.ramp_samps, self.cut_offset)
-        shape = shape if shape is not None else self.__class__.__name__
-        WaveformRegistry.register(shape, self.__class__)
-
-    @staticmethod
-    def core(length, ramp_width, cut_offset):
-        """
-        Create a numpy array containing a smooth box pulse made of two tanh functions subtract from each other.
-
-        :param length: number of points of the pulse
-        :param ramp_width: number of points from cutOffset to 0.95 amplitude
-        :param cut_offset: the initial offset to cut on the tanh Function
-        :return:
-        """
-        t = np.arange(length)
-        c0_, c1_ = np.arctanh(2 * cut_offset - 1), np.arctanh(2 * 0.95 - 1)
-        k_ = (c1_ - c0_) / ramp_width
-        y = (0.5 * (np.tanh(k_ * t + c0_) - np.tanh(k_ * (t - length) - c0_)) - cut_offset) / (1 - cut_offset)
-        return y - np.min(y)
-
-    def _generate_waveform(self, *args, **kwargs):
-        """
-        apply the necessary modificaiton to the core function,
-        generate in-phase (I) and quadrature (Q) components
-        """
-        waveform = self.maxv * self.core(*args, **kwargs)
-        waveform = self._apply_padding(waveform, self.padding)
-        waveform = np.exp(1j * np.deg2rad(self.phase)) * waveform
+        # Apply modulations if any
         for mod in self.modulations:
             waveform = mod.apply_modulation(waveform, self.sampling_rate)
         return waveform
 
 
 class ConcatenateWaveform(Waveform):
-    def __init__(self, prog, gen_ch, waveforms: List[Waveform], phase=0, maxv=None, shape=None):
-        super().__init__(prog, gen_ch, phase, maxv)
+    def __init__(self, soccfg: QickConfig, gen_ch, waveforms: List[Waveform], phase=0, maxv=None, shape=None):
+        super().__init__(soccfg, gen_ch, phase, maxv)
         self.wavefrom_list = waveforms
         self.waveform = self._generate_waveform()
         shape = shape if shape is not None else self.__class__.__name__
@@ -321,10 +357,11 @@ def add_waveform(prog: QickProgram, gen_ch, name, shape, **kwargs):
     name : str
         Name of the pulse
     shape : str
-        shape/type of the pulse, e.g. Gaussian, TanhBoxChirp
+        shape/type of the pulse, e.g. Gaussian, TanhBoxModulated
     """
     if shape.lower() in (wave.lower() for wave in WaveformRegistry.available_waveforms()):
-        pulse = WaveformRegistry.create(shape=shape, prog=prog, gen_ch=gen_ch, **kwargs)
+        # pulse = WaveformRegistry.create(shape=shape, prog=prog, gen_ch=gen_ch, **kwargs)
+        pulse = WaveformRegistry.create(shape=shape, soccfg=prog.soccfg, gen_ch=gen_ch, **kwargs)
         # pulse.plot_waveform()
         pulse.add_waveform(prog, name=name)
     else:
@@ -332,9 +369,131 @@ def add_waveform(prog: QickProgram, gen_ch, name, shape, **kwargs):
                         f"Choose from available shapes: {WaveformRegistry.available_waveforms()},"
                         f"or define new waveforms.")
 
+def add_waveform_from_cfg(prog: QickProgram, gen_ch: str | int, name, **kwargs):
+    """
+    Add a waveform to the DAC channel based on a configuration dictionary.
+    """
+    shape = kwargs.get('shape')
+    if not shape:
+        raise ValueError("cfg_waveform must have a 'shape' key")
 
-def add_waveform_concatenate(prog: QickProgram, gen_ch: str | int, name, gatelist, maxv=None):
-    pass
+    # Create the waveform from the configuration
+    waveform = create_waveform_from_config(prog.soccfg, gen_ch, wf_config=kwargs,
+                                           modulations_config=prog.cfg.get('modulations', {}))
+    waveform.add_waveform(prog, name=name)
+
+def create_waveform_from_config(soccfg: QickConfig, gen_ch: Union[int, str], 
+                                wf_config: dict, modulations_config: dict = None) -> Waveform:
+    ## Todo: generated by claude, need to be tested and debugged. And think about the best way to integrate with the existing codebase.
+    """Create a waveform from config dicts.
+    
+    Parameters
+    ----------
+    soccfg : QickConfig
+        QickConfig object
+    gen_ch : int or str
+        Generator channel
+    wf_config : dict
+        Waveform config dict with 'shape' and waveform-specific parameters.
+        Example: {"shape": "TanhBox", "length": 1, "ramp_width": 0.1, "modulations": ["freq_shift"]}
+    modulations_config : dict, optional
+        Dict mapping modulation names to modulation config dicts.
+        Example: {"freq_shift": {"type": "FrequencyConversion", "freq_if": 10}}
+    
+    Returns
+    -------
+    Waveform
+        Instantiated waveform object
+    
+    Examples
+    --------
+    >>> modulations_cfg = {
+    ...     "freq_shift": {"type": "FrequencyConversion", "freq_if": 10},
+    ...     "drag": {"type": "DragModulation", "drag_factor": 0.05}
+    ... }
+    >>> wf_cfg = {
+    ...     "shape": "TanhBox",
+    ...     "length": 1,
+    ...     "ramp_width": 0.1,
+    ...     "modulations": ["freq_shift", "drag"]
+    ... }
+    >>> wf = create_waveform_from_config(soccfg, gen_ch=0, wf_config=wf_cfg, modulations_config=modulations_cfg)
+    """
+    
+    modulations_config = modulations_config or {}
+    wf_config = wf_config.copy()
+    
+    # Extract shape and modulation names
+    shape = wf_config.pop('shape', None)
+    if shape is None:
+        raise ValueError("wf_config must have a 'shape' key")
+    
+    modulation_names = wf_config.pop('modulations', [])
+    
+    # Create modulation objects from config
+    modulations = []
+    for mod_name in modulation_names:
+        if mod_name not in modulations_config:
+            raise ValueError(f"Modulation '{mod_name}' not found in config['modulations']. "
+                           f"Available: {list(modulations_config.keys())}")
+        mod_config = modulations_config[mod_name]
+        mod = ModulationRegistry.from_dict(mod_config)
+        modulations.append(mod)
+    
+    # Create waveform with modulations
+    wf_config['modulations'] = modulations
+    waveform = WaveformRegistry.create(shape=shape, soccfg=soccfg, gen_ch=gen_ch, **wf_config)
+    return waveform
+
+def add_waveform_concatenate(prog: QickProgram, gen_ch: str | int, name, gatelist: List[Dict], maxv=None):
+    """Concatenate a list of waveforms defined by gatelist and add to the DAC channel.
+    
+    gatelist is a list of dict, each dict contains the parameters to define a waveform, 
+    including 'shape' and waveform-specific parameters.
+    
+    Parameters
+    ----------
+    prog : QickProgram
+        The experiment QickProgram
+    gen_ch : int or str
+        Generator channel
+    name : str
+        Name of the concatenated pulse
+    gatelist : list of dict
+        List of waveform config dicts. Each dict must have 'shape' and waveform parameters.
+        Example: [
+            {"shape": "TanhBox", "length": 0.05, "ramp_width": 0.01},
+            {"shape": "Gaussian", "length": 0.05, "sigma": 0.01}
+        ]
+    maxv : float, optional
+        Maximum voltage for the concatenated waveform.
+    
+    Examples
+    --------
+    >>> gatelist = [
+    ...     {"shape": "TanhBox", "length": 0.05, "ramp_width": 0.01, "padding": [0.01, 0.01]},
+    ...     {"shape": "Gaussian", "length": 0.05, "sigma": 0.01, "padding": [0.01, 0.01]}
+    ... ]
+    >>> add_waveform_concatenate(prog, gen_ch=0, name="concat_pulse", gatelist=gatelist)
+    """
+    if not gatelist:
+        raise ValueError("gatelist cannot be empty")
+    
+    # Get modulations config if available
+    modulations_config = prog.cfg.get('modulations', {}) if hasattr(prog, 'cfg') else {}
+    
+    # Create waveforms from each config
+    waveforms = []
+    for wf_config in gatelist:
+        wf = create_waveform_from_config(prog.soccfg, gen_ch, wf_config=wf_config, 
+                                         modulations_config=modulations_config)
+        waveforms.append(wf)
+    
+    # Create concatenated waveform
+    concat_wf = ConcatenateWaveform(prog.soccfg, gen_ch, waveforms=waveforms, maxv=maxv)
+    
+    # Add to program
+    concat_wf.add_waveform(prog, name=name)
 
 
 if __name__ == "__main__":
@@ -343,56 +502,45 @@ if __name__ == "__main__":
     from Hatlab_RFSOC.waveform import modulation
     import yaml
 
-    # --------------------- initialize a qick program ----------------------------------------------
-    def get_cfg_info(cfgFilePath):
-        yml = yaml.safe_load(open(cfgFilePath))
-        config, info = yml["config"], yml["info"]
-        return config, info
-
-    class Program(QubitMsmtMixin, NDAveragerProgram):
-        def initialize(self):
-            self.sync_all(self.us2cycles(1))  # give processor some time to configure pulses
-
-        def body(self):
-            pass
-
-    cfgFilePath = r"W:\code\SubHarmonic_20250307\RFSOC_phaseReset\config_files\20250307_SubHarmonic_Q1_amp_bigenv2.yml"
-    config, info = get_cfg_info(cfgFilePath)
-    soc, soccfg = getSocProxy(info["PyroServer"])
-    expt_cfg = {"reps":  1, "relax_delay": 20}
-    config.update(expt_cfg)
-    prog = Program(soccfg, config)
+    # --------------------- get qick config -------------------------------------------------------
+    soc, soccfg = getSocProxy("pynq216-04")
 
     # --------------------- generate waveforms ----------------------------------------------------
     # wf = Gaussian(prog, 0, length=0.05, sigma=0.01, phase=0, padding=[0.05, 0.05])
-    wf = TanhBox(prog, 0, length=0.1, ramp_width=0.01, phase=0, padding=[0.015, 0.015])
+    wf = TanhBox(soccfg, 0, length=0.1, ramp_width=0.01, phase=0, padding=[0.015, 0.015])
     wf.plot_waveform()
+    plt.ylim((-35000, 35000))
+    plt.tight_layout()
 
     # --------------------- generate modulated waveforms ----------------------------------------------------
     # define modulations
     def cfunc(amp, maxf, maxv):
         return maxf * (amp/maxv)**2
     cm = modulation.ChirpModulation(chirp_func=cfunc, maxf=-50, maxv=30000)
-    dm = modulation.DragModulation(0.003)
+    # dm = modulation.DragModulation(0.00)
+    dm = modulation.ModulationRegistry.create("DragModulation", drag_factor=0.001)
 
-    wf2 = GaussianModulated(prog=prog, gen_ch=0, length=0.05, sigma=0.01, phase=0, padding=[0.015, 0.015],
-                            modulations=[dm, cm], shape="GaussianChirpDrag")
-    wf2 = TanhBoxModulated(prog=prog, gen_ch=0, length=0.05, ramp_width=0.01, phase=0, padding=[0.015, 0.015],
+    # wf2 = GaussianModulated(soccfg=soccfg, gen_ch=0, length=0.05, sigma=0.01, phase=0, padding=[0.015, 0.015],
+    #                         modulations=[dm, cm], shape="GaussianChirpDrag")
+    wf2 = TanhBoxModulated(soccfg=soccfg, gen_ch=0, length=0.05, ramp_width=0.01, phase=0, padding=[0.015, 0.015],
                            modulations=[dm, cm], shape="TanhboxChirpDrag")
     wf2.plot_waveform()
 
-    wfc = ConcatenateWaveform(prog=prog, gen_ch=0, waveforms=[wf, wf2], phase=0, shape="concatenated_pulse_1")
+    wfc = ConcatenateWaveform(soccfg=soccfg, gen_ch=0, waveforms=[wf, wf2], phase=0, shape="concatenated_pulse_1")
     wfc.plot_waveform()
 
     corrFile = r"W:\data\SubHarmonic\WileE_20250326\Q1\calibration\\" \
                r"Q1_DAC0_Line1_Subh1000-1300MHz_5000DAC_Q3700-3720MHz_8000DAC-2_epsilon_smoothed(2).csv"
     wcorr = modulation.WaveformCorrection(filepath=corrFile, freq=1100, scale="linear", max_scale=0.5)
-    wfcorr = TanhBoxModulated(prog=prog, gen_ch=0, length=0.1, ramp_width=0.01, phase=0, padding=[0.015, 0.015],
+    wfcorr = TanhBoxModulated(soccfg=soccfg, gen_ch=0, length=0.1, ramp_width=0.01, phase=0, padding=[0.05, 0.05],
                            modulations=[cm, wcorr], shape="TanhboxCorrected")
-    wfcorr = GaussianModulated(prog=prog, gen_ch=0, length=0.1, sigma=0.02, phase=0, padding=[0.015, 0.015],
-                           modulations=[wcorr], shape="GaussianCorrected")
+    wfcorr = TanhBoxModulated(soccfg=soccfg, gen_ch=0, length=0.1, ramp_width=0.01, phase=0, padding=[0.015, 0.015],
+                           modulations=[wcorr], shape="TanhboxCorrected")
+    # wfcorr = GaussianModulated(soccfg=soccfg, gen_ch=0, length=0.1, sigma=0.02, phase=0, padding=[0.015, 0.015],
+    #                        modulations=[wcorr], shape="GaussianCorrected")
     wfcorr.plot_waveform()
-    plt.ylim((-30000, 33000))
+    plt.ylim((-35000, 35000))
+    plt.tight_layout()
 
     wf_fft = wcorr.compute_fourier_transform(wfcorr.waveform, wfcorr.sampling_rate)
     plt.figure()
@@ -408,5 +556,14 @@ if __name__ == "__main__":
     plt.plot(t_list, np.abs(signal_wc), label="corrected")
     plt.plot(t_list, np.abs(signal_recv), label="undo")
     plt.legend()
+
+    fconv = modulation.FrequencyConversion(-1000)
+    wfcorr = TanhBoxModulated(soccfg=soccfg, gen_ch=0, length=0.1, ramp_width=0.01, phase=0, padding=[0.025, 0.025],
+                           modulations=[fconv], shape="TanhboxShifted")
+    wf_fft = wcorr.compute_fourier_transform(wfcorr.waveform, wfcorr.sampling_rate)
+    plt.figure()
+    plt.plot(wf_fft[0], wf_fft[1])
+    plt.figure()
+    plt.plot(np.real(wfcorr.waveform))
 
 
