@@ -221,30 +221,43 @@ class FileDefined(Waveform):
     def core(filepath, **kwargs):
         """
         Reads waveform data (I, Q) from the file.
+        
+        Supports data in two formats:
+        - (N, 2): columns are I and Q
+        - (2, N): rows are I and Q
 
         param filepath: the filepath of the waveform
-        return:
+        return: complex waveform
         """
         # todo: deal with file formats
         filetype = filepath.split(".")[-1]
         if filetype == "npy":
             data = np.load(filepath, **kwargs)
-            idata = data[:, 0]  # First column: I data
-            qdata = data[:, 1]  # Second column: Q data
-            return idata + 1j * qdata
         elif filetype == "csv":
-            data = np.loadtxt(filepath, **kwargs)  # Assuming the file contains a two-column format (I, Q)
-            idata = data[:, 0]  # First column: I data
-            qdata = data[:, 1]  # Second column: Q data
-            return idata + 1j * qdata
+            data = np.loadtxt(filepath, delimiter=',', **kwargs)
         else:
             try:
-                data = np.loadtxt(filepath, **kwargs)  # Assuming the file contains a two-column format (I, Q)
-                idata = data[:, 0]  # First column: I data
-                qdata = data[:, 1]  # Second column: Q data
-                return idata + 1j * qdata
+                data = np.loadtxt(filepath, **kwargs)
             except Exception as e:
                 raise ValueError(f"Error reading file {filepath}. Exception {e}")
+        
+        # Handle data shape: (N, 2) means columns are I,Q; (2, N) means rows are I,Q
+        data = np.asarray(data)
+        if data.ndim == 2:
+            if data.shape[1] == 2:
+                # Shape (N, 2): columns are I and Q
+                idata = data[:, 0]
+                qdata = data[:, 1]
+            elif data.shape[0] == 2:
+                # Shape (2, N): rows are I and Q
+                idata = data[0]
+                qdata = data[1]
+            else:
+                raise ValueError(f"Data shape {data.shape} not recognized. Expected (N, 2) or (2, N)")
+        else:
+            raise ValueError(f"Expected 2D data, got shape {data.shape}")
+        
+        return idata + 1j * qdata
 
     def _generate_waveform(self, *args, **kwargs):
         """
@@ -264,7 +277,7 @@ class Arbitrary(Waveform):
     
     Accepts IQ data directly as a complex array or separate I and Q arrays.
     """
-    def __init__(self, soccfg: QickConfig, gen_ch, iq_data: Union[np.ndarray, tuple], 
+    def __init__(self, soccfg: QickConfig, gen_ch, iq_data, 
                  phase=0, maxv=None, padding: Union[float, List[float], None] = None,
                  modulations: Union[List, tuple] = None, shape=None):
         """
@@ -274,10 +287,12 @@ class Arbitrary(Waveform):
             QickConfig object
         gen_ch : int or str
             Generator channel
-        iq_data : np.ndarray or tuple
-            Complex IQ data as:
+        iq_data : array-like
+            Complex or IQ data as:
             - Complex array: np.array([1+1j, 2+2j, ...])
-            - Tuple of (I, Q) arrays: (idata, qdata)
+            - (I, Q) sequence: (idata, qdata) or [idata, qdata]
+            - 2D array shape (N, 2): columns are I and Q
+            - Any array-like format convertible via np.asarray()
         phase : float
             Phase in degrees
         maxv : float, optional
@@ -298,32 +313,45 @@ class Arbitrary(Waveform):
             WaveformRegistry.register(shape, self.__class__)
 
     @staticmethod
-    def core(iq_data: Union[np.ndarray, tuple]) -> np.ndarray:
+    def core(iq_data) -> np.ndarray:
         """Convert IQ data to complex waveform.
         
         Parameters
         ----------
-        iq_data : np.ndarray or tuple
-            Complex array or (I, Q) tuple
+        iq_data : array-like
+            Complex or IQ data as:
+            - Complex array: np.array([1+1j, 2+2j, ...])
+            - (I, Q) sequence: (idata, qdata) or [idata, qdata]
+            - 2D array shape (N, 2): columns are I and Q
+            - Any other array-like format convertible to complex via np.asarray()
         
         Returns
         -------
         np.ndarray
             Complex waveform
         """
-        if isinstance(iq_data, tuple) and len(iq_data) == 2:
-            idata, qdata = iq_data
-            return np.asarray(idata) + 1j * np.asarray(qdata)
-        else:
-            return np.asarray(iq_data)
+        # Try to handle (I, Q) format for tuple or list
+        if isinstance(iq_data, (tuple, list)) and len(iq_data) == 2:
+            try:
+                idata = np.asarray(iq_data[0])
+                qdata = np.asarray(iq_data[1])
+                # Verify both are arrays and have compatible shapes
+                if idata.shape == qdata.shape and idata.ndim >= 1:
+                    return idata + 1j * qdata
+            except (TypeError, IndexError, ValueError):
+                pass
+        
+        # Try as generic array-like and check if 2D with shape (N, 2)
+        iq_data_arr = np.asarray(iq_data)
+        if iq_data_arr.ndim == 2 and iq_data_arr.shape[1] == 2:
+            return iq_data_arr[:, 0] + 1j * iq_data_arr[:, 1]
+        
+        # Otherwise treat as complex array directly
+        return iq_data_arr
 
     def _generate_waveform(self, iq_data: Union[np.ndarray, tuple]):
         """Generate waveform from IQ data with optional modulations."""
         waveform = self.core(iq_data)
-        # Normalize to maxv
-        waveform_max = np.max(np.abs(waveform))
-        if waveform_max > 0:
-            waveform = self.maxv * waveform / waveform_max
         waveform = self._apply_padding(waveform, self.padding)
         waveform = np.exp(1j * np.deg2rad(self.phase)) * waveform
         # Apply modulations if any
