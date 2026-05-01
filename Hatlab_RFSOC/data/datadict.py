@@ -318,7 +318,7 @@ class DataFromQDDH5:
                 # get values of sweep axes from metadata if saved in metadata
                 ax_val = _get_eval_meta(self.datadict, ax)
                 ax_dim = len(ax_val)
-                if ax_val == "None": # sweep axis not saved in meta
+                if isinstance(ax_val, str) and ax_val == "None": # sweep axis not saved in meta
                     ax_dim = -1
                     ax_val = None
                 #     # assume the data were added in order of sweep axes, this should give us the right axes values
