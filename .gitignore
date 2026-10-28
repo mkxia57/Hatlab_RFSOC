@@ -2,3 +2,8 @@
 .idea/
 *.dat
 Hatlab_RFSOC.egg-info/
+.claude/
+.gitnexus/
+.vscode/
+AGENTS.md
+CLAUDE.md

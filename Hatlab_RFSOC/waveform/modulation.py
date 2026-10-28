@@ -274,10 +274,12 @@ class WaveformCorrection(Modulation):
         if freq_ref is None:
             if scale.lower() in ["db", "dbm", "log"]:
                 self.freq_ref = self.calibration_data[0][
-                    np.argmin(np.abs(self.calibration_data[1] - (np.max(self.calibration_data[1]) + 10*np.log10(max_scale))))]
+                    np.argmin(np.abs(self.calibration_data[1] - (np.max(self.calibration_data[1]) + 20*np.log10(max_scale))))]
             elif scale.lower() == "linear":
                 self.freq_ref = self.calibration_data[0][
                     np.argmin(np.abs(self.calibration_data[1] - max_scale*np.max(self.calibration_data[1])))]
+        else:
+            self.freq_ref = freq_ref
 
         self.calibration_func = self.get_calibration_func(freq_ref=self.freq_ref, attenuation=0)
         self.recover_func = self.get_recover_func(freq_ref=self.freq_ref, attenuation=0)
@@ -392,7 +394,7 @@ class WaveformCorrection(Modulation):
             freq_MHz = self.calibration_data[0]
             S21_dbm = self.calibration_data[1]
             S21_interpolate = CubicSpline(freq_MHz, S21_dbm + attenuation)
-            interpolation = CubicSpline(freq_MHz, 10 ** ((-S21_dbm + S21_interpolate(freq_ref)) / 10))
+            interpolation = CubicSpline(freq_MHz, 10 ** ((-S21_dbm + S21_interpolate(freq_ref)) / 20))
         elif self.scale.lower() == "linear":
             freq_MHz = self.calibration_data[0]
             S21 = self.calibration_data[1]
